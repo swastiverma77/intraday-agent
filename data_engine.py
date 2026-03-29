@@ -1,7 +1,7 @@
 import logging
 import time
+import requests
 from datetime import datetime
-
 from breeze_connect import BreezeConnect
 import breeze_client as bc
 import agent_config as config
@@ -15,7 +15,6 @@ NSE_HEADERS = {
     'Referer': 'https://www.nseindia.com/',
 }
 
-# Map our sector names to NSE index names
 NSE_SECTOR_MAP = {
     "IT":        "NIFTY IT",
     "Bank":      "NIFTY BANK",
@@ -31,117 +30,100 @@ NSE_SECTOR_MAP = {
     "PSU Bank":  "NIFTY PSU BANK",
 }
 
-# Persistent NSE session — reused across calls
-_nse_session = None
 
 def _get_nse_session():
-    """Returns a valid NSE session with cookies."""
-    import requests
-    global _nse_session
+    """Always creates a fresh NSE session with valid cookies."""
     try:
-        if _nse_session is None:
-            _nse_session = requests.Session()
-        _nse_session.get('https://www.nseindia.com', headers=NSE_HEADERS, timeout=10)
+        session = requests.Session()
+        session.get('https://www.nseindia.com', headers=NSE_HEADERS, timeout=10)
         time.sleep(1)
-        return _nse_session
-    except Exception:
-        _nse_session = None
+        return session
+    except Exception as e:
+        logger.error(f"NSE session creation failed: {e}")
         return None
 
 
 def get_nse_sector_data() -> dict:
     """
     Fetches live sector index data from NSE India API.
+    Always creates fresh session to avoid stale cookies.
     Returns dict: {sector_name: {ltp, change_pct}}
     """
+    for attempt in range(1, 3):
+        try:
+            session = _get_nse_session()
+            if not session:
+                continue
+
+            resp = session.get(
+                'https://www.nseindia.com/api/allIndices',
+                headers=NSE_HEADERS,
+                timeout=10
+            )
+
+            if resp.status_code != 200:
+                logger.error(f"NSE API status: {resp.status_code}")
+                continue
+
+            data    = resp.json()
+            indices = {idx['index']: idx for idx in data.get('data', [])}
+
+            result = {}
+            for sector, nse_name in NSE_SECTOR_MAP.items():
+                idx = indices.get(nse_name)
+                if idx:
+                    result[sector] = {
+                        "ltp":        float(idx.get('last', 0)),
+                        "change_pct": float(idx.get('percentChange', 0)),
+                        "name":       sector,
+                    }
+
+            if len(result) >= 8:
+                logger.info(f"NSE sector data fetched: {len(result)} sectors")
+                return result
+
+            logger.warning(f"Attempt {attempt}: only {len(result)} sectors — retrying...")
+            time.sleep(5)
+
+        except Exception as e:
+            logger.error(f"get_nse_sector_data attempt {attempt} failed: {e}")
+            time.sleep(5)
+
+    logger.error("All NSE sector data attempts failed")
+    return {}
+
+
+def get_nifty_from_nse() -> float:
+    """Fetch Nifty 50 price from NSE API as fallback."""
     try:
         session = _get_nse_session()
         if not session:
-            return {}
+            return 0
         resp = session.get(
             'https://www.nseindia.com/api/allIndices',
             headers=NSE_HEADERS,
             timeout=10
         )
-        if resp.status_code != 200:
-            logger.error(f"NSE API status: {resp.status_code}")
-            return {}
-
-        data    = resp.json()
-        indices = {idx['index']: idx for idx in data.get('data', [])}
-
-        result = {}
-        for sector, nse_name in NSE_SECTOR_MAP.items():
-            idx = indices.get(nse_name)
-            if idx:
-                result[sector] = {
-                    "ltp":        float(idx.get('last', 0)),
-                    "change_pct": float(idx.get('percentChange', 0)),
-                    "name":       sector,
-                }
-        if len(result) < 8:
-            logger.warning(f"Only {len(result)} sectors returned — retrying...")
-            raise Exception("Insufficient sector data")
-
-        logger.info(f"NSE sector data fetched: {len(result)} sectors")
-        return result
-
+        indices = {d['index']: d for d in resp.json().get('data', [])}
+        nifty   = indices.get('NIFTY 50', {})
+        return float(nifty.get('last', 0))
     except Exception as e:
-        logger.error(f"get_nse_sector_data failed: {e} — retrying in 5s")
-        try:
-            time.sleep(5)
-            session2 = requests.Session()
-            session2.get('https://www.nseindia.com', headers=NSE_HEADERS, timeout=10)
-            time.sleep(2)
-            resp2 = session2.get('https://www.nseindia.com/api/allIndices', headers=NSE_HEADERS, timeout=10)
-            data2 = resp2.json()
-            indices2 = {idx['index']: idx for idx in data2.get('data', [])}
-            result2 = {}
-            for sector, nse_name in NSE_SECTOR_MAP.items():
-                idx = indices2.get(nse_name)
-                if idx:
-                    result2[sector] = {
-                        "ltp":        float(idx.get('last', 0)),
-                        "change_pct": float(idx.get('percentChange', 0)),
-                        "name":       sector,
-                    }
-            logger.info(f"NSE retry successful: {len(result2)} sectors")
-            return result2
-        except Exception as e2:
-            logger.error(f"NSE retry also failed: {e2}")
-            return {}
+        logger.error(f"get_nifty_from_nse failed: {e}")
+        return 0
 
 
 def get_premarket_snapshot(breeze: BreezeConnect) -> dict:
     logger.info("Fetching pre-market snapshot...")
     breadth = bc.get_market_breadth(breeze)
 
-    # Try multiple Nifty codes for pre-market
+    # Try Breeze first, fall back to NSE API
     nifty_settled = 0
-    for code in ["NIFTY", "NIFTY 50", "Nifty 50"]:
-        q = bc.get_index_quote(breeze, code)
-        if q and q.get("ltp", 0) > 0:
-            nifty_settled = q["ltp"]
-            break
-
-    # Fallback: use NSE API for Nifty pre-market price
-    if nifty_settled == 0:
-        try:
-            import requests
-            session = requests.Session()
-            session.get('https://www.nseindia.com', headers=NSE_HEADERS, timeout=10)
-            import time as _time
-            _time.sleep(1)
-            resp = session.get(
-                'https://www.nseindia.com/api/allIndices',
-                headers=NSE_HEADERS, timeout=10
-            )
-            indices = {d['index']: d for d in resp.json().get('data', [])}
-            nifty_data = indices.get('NIFTY 50', {})
-            nifty_settled = float(nifty_data.get('last', 0))
-            logger.info(f"Nifty pre-market from NSE API: {nifty_settled}")
-        except Exception as e:
-            logger.error(f"NSE API Nifty fallback failed: {e}")
+    q = bc.get_index_quote(breeze, "NIFTY")
+    if q and q.get("ltp", 0) > 0:
+        nifty_settled = q["ltp"]
+    else:
+        nifty_settled = get_nifty_from_nse()
+        logger.info(f"Nifty from NSE API: {nifty_settled}")
 
     logger.info(f"Pre-market: Adv={breadth['advances']} Dec={breadth['declines']} Nifty={nifty_settled}")
     return {
@@ -152,9 +134,15 @@ def get_premarket_snapshot(breeze: BreezeConnect) -> dict:
 
 def get_live_market_snapshot(breeze: BreezeConnect) -> dict:
     logger.info("Fetching live market snapshot...")
-    nifty_quote  = bc.get_index_quote(breeze, "NIFTY")
-    sector_raw   = get_nse_sector_data()
 
+    # Nifty from Breeze, fallback to NSE
+    nifty_quote = bc.get_index_quote(breeze, "NIFTY")
+    if not nifty_quote or nifty_quote.get("ltp", 0) == 0:
+        nifty_price = get_nifty_from_nse()
+        nifty_quote = {"ltp": nifty_price, "change_pct": 0, "index": "NIFTY"}
+
+    # Sector data from NSE API
+    sector_raw  = get_nse_sector_data()
     sector_data = []
     for name, data in sector_raw.items():
         sector_data.append({
@@ -163,9 +151,9 @@ def get_live_market_snapshot(breeze: BreezeConnect) -> dict:
             "change_pct": data["change_pct"],
         })
 
-    # For SELL: most negative first. For BUY: most positive first.
-    # Since we don't know direction here, sort by absolute change (strongest movers first)
+    # Sort by absolute change — strongest movers first
     sector_data.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+
     breadth = bc.get_market_breadth(breeze)
 
     return {
