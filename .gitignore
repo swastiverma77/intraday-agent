@@ -1,0 +1,8 @@
+venv/
+logs/
+state/
+security_master/
+__pycache__/
+*.pyc
+.wdm/
+deploy/
