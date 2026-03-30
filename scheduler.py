@@ -71,9 +71,11 @@ def _ensure_session(breeze, reinit_func):
 
 
 def run_daily_cycle(breeze):
-    if not _is_trading_day():
-        logger.info("Weekend — skipping cycle")
-        tg.send("📅 Today is a weekend. Agent will resume Monday.")
+     if not _is_trading_day():
+        from holidays import is_trading_day
+        _, reason = is_trading_day()
+        logger.info(f"Not a trading day: {reason}")
+        tg.send(f"📅 Market closed today — {reason}. Agent resumes next trading day.")
         return
 
     state = {
