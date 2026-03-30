@@ -1,7 +1,6 @@
 import logging
 import time
 import json
-import asyncio
 from datetime import datetime, date, timedelta
 
 import agent_config as config
@@ -52,6 +51,21 @@ def load_state() -> dict:
         return {}
 
 
+def _ensure_session(breeze, reinit_func):
+    """Check session is valid, re-login if expired."""
+    if not bc.is_session_valid(breeze):
+        logger.warning("Session expired — re-logging in...")
+        tg.send("⚠️ Session expired. Re-logging in...")
+        try:
+            new_breeze = reinit_func()
+            ce.set_breeze(new_breeze)
+            return new_breeze
+        except Exception as e:
+            logger.error(f"Re-login failed: {e}")
+            tg.alert_error("Re-login failed", str(e))
+    return breeze
+
+
 def run_daily_cycle(breeze):
     if not _is_trading_day():
         logger.info("Weekend — skipping cycle")
@@ -70,7 +84,7 @@ def run_daily_cycle(breeze):
 
     ce.set_breeze(breeze)
 
-    # Phase 1: 9:10 Pre-market
+    # ── Phase 1: 9:10 Pre-market ──────────────────────────────────────────────
     _wait_until(config.PRE_MARKET_TIME)
     logger.info("=== Phase 1: Pre-market snapshot ===")
     try:
@@ -82,7 +96,7 @@ def run_daily_cycle(breeze):
         logger.error(f"Phase 1 error: {e}")
         tg.alert_error("Pre-market snapshot", str(e))
 
-    # Phase 2: 9:15-9:30 Live updates
+    # ── Phase 2: 9:15–9:30 Live updates ──────────────────────────────────────
     _wait_until(config.MARKET_OPEN_TIME)
     logger.info("=== Phase 2: Live market monitoring ===")
 
@@ -106,8 +120,11 @@ def run_daily_cycle(breeze):
             logger.error(f"Market update {t} error: {e}")
             tg.alert_error(f"Market update {t}", str(e))
 
-    # Phase 3: Direction + stock selection
+    # ── Phase 3: Direction + stock selection ──────────────────────────────────
     logger.info("=== Phase 3: Direction + stock selection ===")
+    breeze = _ensure_session(breeze, bc.init_breeze)
+    ce.set_breeze(breeze)
+
     try:
         direction_result = de.determine_direction(state["snapshots"])
         direction        = direction_result["direction"]
@@ -146,7 +163,7 @@ def run_daily_cycle(breeze):
         tg.alert_error("Direction/selection", str(e))
         return
 
-    # Phase 4: Volume baseline
+    # ── Phase 4: Volume baseline ───────────────────────────────────────────────
     logger.info("=== Phase 4: Volume baseline ===")
     baselines = {}
     for pick in picks:
@@ -161,8 +178,10 @@ def run_daily_cycle(breeze):
     state["baselines"] = {k: v.get("min_volume") for k, v in baselines.items()}
     save_state(state)
 
-    # Phase 5: Signal scanning 9:30 to 10:30
+    # ── Phase 5: Signal scanning 9:30 → 10:30 ─────────────────────────────────
     logger.info("=== Phase 5: Signal scanning loop ===")
+    breeze  = _ensure_session(breeze, bc.init_breeze)
+    ce.set_breeze(breeze)
     scanner = ce.SignalScanner(picks, direction, baselines)
     cutoff  = datetime.strptime(config.CUTOFF_TIME, "%H:%M").time()
 
@@ -181,7 +200,7 @@ def run_daily_cycle(breeze):
 
         time.sleep(30)
 
-    # Phase 6: 10:30 cutoff
+    # ── Phase 6: 10:30 cutoff ──────────────────────────────────────────────────
     logger.info("=== Phase 6: Cutoff ===")
     if not state["trade_taken"]:
         tg.alert_no_trade()
