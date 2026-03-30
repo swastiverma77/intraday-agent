@@ -18,7 +18,11 @@ def _now_str() -> str:
 
 
 def _is_trading_day() -> bool:
-    return date.today().weekday() < 5
+    from holidays import is_trading_day
+    trading, reason = is_trading_day()
+    if not trading:
+        logger.info(f"Not a trading day: {reason}")
+    return trading
 
 
 def _wait_until(target_hhmm: str, check_interval: int = 10):
