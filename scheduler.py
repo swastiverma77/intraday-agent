@@ -71,7 +71,7 @@ def _ensure_session(breeze, reinit_func):
 
 
 def run_daily_cycle(breeze):
-     if not _is_trading_day():
+    if not _is_trading_day():
         from holidays import is_trading_day
         _, reason = is_trading_day()
         logger.info(f"Not a trading day: {reason}")
