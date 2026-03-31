@@ -55,19 +55,19 @@ class SignalScanner:
             stock = pick["stock"]
             base  = baselines.get(stock, {})
             self.states[stock] = {
-                "pick":            pick,
-                "min_volume":      base.get("min_volume", float("inf")),
-                "all_volumes":     [c["volume"] for c in base.get("candles", [])],
-                "pending_signal":  None,
-                "trade_done":      False,
-                "last_scanned_dt": None,
+                "pick":              pick,
+                "all_volumes":       [c["volume"] for c in base.get("candles", [])],
+                "pending_signal":    None,
+                "candles_watched":   0,       # candles watched after signal
+                "trade_done":        False,
+                "last_scanned_dt":   None,
             }
 
     def scan_all(self) -> list:
-        signals = []
-        today   = date.today()
-        now     = datetime.now()
-        from_dt = datetime.combine(today, datetime.strptime("09:30", "%H:%M").time())
+        signals  = []
+        today    = date.today()
+        now      = datetime.now()
+        from_dt  = datetime.combine(today, datetime.strptime("09:30", "%H:%M").time())
 
         for stock, state in self.states.items():
             if state["trade_done"]:
@@ -77,6 +77,7 @@ class SignalScanner:
             if not candles:
                 continue
 
+            # Only process completed candles (exclude currently forming one)
             completed = candles[:-1] if len(candles) > 1 else candles
 
             for candle in completed:
@@ -84,31 +85,91 @@ class SignalScanner:
                 if dt_str == state["last_scanned_dt"]:
                     continue
                 state["last_scanned_dt"] = dt_str
-                signal = self._evaluate_candle(stock, state, candle)
-                if signal:
-                    signals.append(signal)
+
+                result = self._process_candle(stock, state, candle)
+                if result:
+                    signals.append(result)
 
         return signals
 
-    def _evaluate_candle(self, stock: str, state: dict, candle: dict):
+    def _process_candle(self, stock: str, state: dict, candle: dict):
+        """
+        Two modes:
+        1. No pending signal → look for new signal candle
+        2. Pending signal → watch for entry trigger or cancel conditions
+        """
         vol    = candle["volume"]
-        is_red = candle["close"] < candle["open"]
-        is_grn = candle["close"] > candle["open"]
+        high   = candle["high"]
+        low    = candle["low"]
+        close  = candle["close"]
+        open_  = candle["open"]
+        is_red = close < open_
+        is_grn = close > open_
 
+        # ── Mode 2: Pending signal — check cancel conditions ──────────────────
         if state["pending_signal"]:
-            if self.direction == "BUY" and is_red:
-                tg.alert_signal_cancelled(
-                    stock,
-                    "New red candle before entry — resetting"
-                )
-                state["pending_signal"] = None
-            elif self.direction == "SELL" and is_grn:
-                tg.alert_signal_cancelled(
-                    stock,
-                    "New green candle before entry — resetting"
-                )
-                state["pending_signal"] = None
+            sig           = state["pending_signal"]
+            sig_high      = sig["candle_high"]
+            sig_low       = sig["candle_low"]
+            sig_vol       = sig["candle_volume"]
+            candles_watched = state["candles_watched"] + 1
+            state["candles_watched"] = candles_watched
 
+            cancel_reason = None
+
+            if self.direction == "BUY":
+                # Cancel: red candle closes BELOW signal candle low
+                if is_red and close < sig_low:
+                    cancel_reason = f"Red candle closed below signal low {sig_low:.2f}"
+                # Cancel: new candle has lower volume than signal candle
+                elif vol < sig_vol:
+                    cancel_reason = f"New candle vol {vol:,} < signal vol {sig_vol:,}"
+
+            else:  # SELL
+                # Cancel: green candle closes ABOVE signal candle high
+                if is_grn and close > sig_high:
+                    cancel_reason = f"Green candle closed above signal high {sig_high:.2f}"
+                # Cancel: new candle has lower volume than signal candle
+                elif vol < sig_vol:
+                    cancel_reason = f"New candle vol {vol:,} < signal vol {sig_vol:,}"
+
+            # Cancel: exceeded max watch window (3 candles)
+            if candles_watched >= 3 and not cancel_reason:
+                cancel_reason = "Entry not triggered within 3 candles"
+
+            if cancel_reason:
+                tg.alert_signal_cancelled(stock, cancel_reason)
+                state["pending_signal"]  = None
+                state["candles_watched"] = 0
+                state["all_volumes"].append(vol)
+                # Fall through to check if THIS candle is a new signal
+            else:
+                # Still within window — check if limit was triggered
+                entry = sig["entry"]
+                if self.direction == "BUY" and high >= entry:
+                    logger.info(f"{stock} BUY entry triggered @ {entry}")
+                    state["trade_done"] = True
+                    tg.send(
+                        f"🟢 <b>ENTRY TRIGGERED — {stock}</b>\n"
+                        f"BUY limit hit @ ₹{entry:,.2f}\n"
+                        f"SL: ₹{sig['sl']:,.2f} | Target: ₹{sig['target']:,.2f}"
+                    )
+                    return None
+
+                elif self.direction == "SELL" and low <= entry:
+                    logger.info(f"{stock} SELL entry triggered @ {entry}")
+                    state["trade_done"] = True
+                    tg.send(
+                        f"🔴 <b>ENTRY TRIGGERED — {stock}</b>\n"
+                        f"SELL limit hit @ ₹{entry:,.2f}\n"
+                        f"SL: ₹{sig['sl']:,.2f} | Target: ₹{sig['target']:,.2f}"
+                    )
+                    return None
+
+                state["all_volumes"].append(vol)
+                return None
+
+        # ── Mode 1: No pending signal — scan for new signal candle ───────────
         is_signal_color = (self.direction == "BUY" and is_red) or \
                           (self.direction == "SELL" and is_grn)
 
@@ -116,14 +177,13 @@ class SignalScanner:
             state["all_volumes"].append(vol)
             return None
 
+        # Volume must be lower than ALL previous candles
         if state["all_volumes"] and vol >= min(state["all_volumes"]):
             state["all_volumes"].append(vol)
             return None
 
+        # ── Signal candle found! ──────────────────────────────────────────────
         state["all_volumes"].append(vol)
-
-        high = candle["high"]
-        low  = candle["low"]
 
         if self.direction == "BUY":
             entry  = round(high + 0.05, 2)
@@ -157,8 +217,9 @@ class SignalScanner:
             "candle_low":    low,
         }
 
-        state["pending_signal"] = signal
-        logger.info(f"Signal: {self.direction} {stock} entry={entry} sl={sl} target={target}")
+        state["pending_signal"]  = signal
+        state["candles_watched"] = 0
+        logger.info(f"Signal: {self.direction} {stock} entry={entry} sl={sl} target={target} vol={vol}")
         return signal
 
     def mark_trade_done(self, stock: str):
