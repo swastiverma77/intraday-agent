@@ -206,6 +206,19 @@ def init_breeze() -> BreezeConnect:
     logger.info("Breeze session initialised successfully")
     return breeze
 
+def is_session_valid(breeze: BreezeConnect) -> bool:
+    """Quick check if Breeze session is still active."""
+    try:
+        resp = breeze.get_quotes(
+            stock_code="ITC",
+            exchange_code="NSE",
+            product_type="cash",
+            right="",
+            strike_price=""
+        )
+        return bool(resp and resp.get("Success"))
+    except Exception:
+        return False
 
 def get_ltp(breeze: BreezeConnect, stock_code: str) -> dict:
     try:
