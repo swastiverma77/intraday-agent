@@ -12,6 +12,8 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 CAPITAL_PER_TRADE   = float(os.getenv("CAPITAL_PER_TRADE", "50000"))
 RISK_REWARD_RATIO   = 2.0
+RISK_PER_TRADE      = float(os.getenv("RISK_PER_TRADE", "1000"))
+MAX_TRADES          = int(os.getenv("MAX_TRADES", "3"))
 MAX_GAP_PERCENT     = 2.0
 MAX_STOCKS_PER_SECTOR = 2
 NUM_SECTORS         = 2
